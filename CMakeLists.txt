@@ -9,7 +9,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 # Create the executable
-add_executable(Marco_Rossi_Ferrini_Kmeans_OpenMP main.cpp)
+add_executable(Marco_Rossi_Ferrini_Kmeans_OpenMP main.cpp
+        kmeans_sequential.h
+        kmeans_sequential.cpp)
 
 # Enable OpenMP for the executable
 target_link_libraries(Marco_Rossi_Ferrini_Kmeans_OpenMP
