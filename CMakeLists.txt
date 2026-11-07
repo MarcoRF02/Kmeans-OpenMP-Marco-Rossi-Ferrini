@@ -11,7 +11,9 @@ find_package(OpenMP REQUIRED COMPONENTS CXX)
 # Create the executable
 add_executable(Marco_Rossi_Ferrini_Kmeans_OpenMP main.cpp
         kmeans_sequential.h
-        kmeans_sequential.cpp)
+        kmeans_sequential.cpp
+        kmeans_openmp.cpp
+        kmeans_openmp.h)
 
 # Enable OpenMP for the executable
 target_link_libraries(Marco_Rossi_Ferrini_Kmeans_OpenMP
