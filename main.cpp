@@ -7,18 +7,22 @@
 #include "kmeans_openmp.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <omp.h>
 
 using namespace std;
 
 // Select the implementations and datasets before compiling.
 constexpr bool RUN_SEQUENTIAL = true;
 constexpr bool RUN_OPENMP = true;
+constexpr int OPENMP_THREADS = 4;
 constexpr bool RUN_ALL_DATASETS = false;
 constexpr const char* DATASET_DIRECTORY = "datasets";
 constexpr const char* SELECTED_DATASET = "blobs_N100000_D16.txt";
@@ -26,12 +30,13 @@ constexpr const char* SELECTED_DATASET = "blobs_N100000_D16.txt";
 constexpr int K = 10;
 constexpr int MAX_ITERATIONS = 100;
 constexpr int WARMUP_RUNS = 2;
-constexpr int MEASURED_RUNS = 50;
+constexpr int MEASURED_RUNS = 30;
 constexpr bool PIN_TO_CORE = true;
 constexpr int LOGICAL_CPU = 2;
 
 static_assert(RUN_SEQUENTIAL || RUN_OPENMP, "Enable at least one implementation.");
 static_assert(WARMUP_RUNS >= 0, "WARMUP_RUNS cannot be negative.");
+static_assert(OPENMP_THREADS > 0, "OPENMP_THREADS must be positive.");
 static_assert(MEASURED_RUNS > 0, "MEASURED_RUNS must be positive.");
 
 static_assert(LOGICAL_CPU >= 0 &&
@@ -93,7 +98,10 @@ vector<filesystem::path> select_datasets() {
     return paths;
 }
 
-void benchmark(
+using Centroids = vector<vector<double>>;
+using CentroidRuns = vector<Centroids>;
+
+CentroidRuns benchmark(
     const char* implementation_name,
     decltype(&kmeans) run_kmeans,
     const vector<vector<double>>& points
@@ -123,6 +131,7 @@ void benchmark(
 
     vector<double> times(MEASURED_RUNS);
     vector<int> iteration_counts(MEASURED_RUNS);
+    CentroidRuns measured_centroids(MEASURED_RUNS, centroids);
 
     cout << "\nImplementation: " << implementation_name << "\n";
     cout << "Running " << WARMUP_RUNS << " warm-ups and "
@@ -162,6 +171,9 @@ void benchmark(
                 chrono::duration<double>(end - start).count();
 
             iteration_counts[index] = iterations;
+
+            // Save the result after stopping the timer.
+            measured_centroids[index] = centroids;
         }
     }
 
@@ -193,18 +205,59 @@ void benchmark(
     cout << "Minimum time: " << sorted_times.front() << " s\n";
     cout << "Maximum time: " << sorted_times.back() << " s\n";
 
-    // Print the centroids from the last run.
-    cout << "\nFinal centroids:\n";
+    return measured_centroids;
+}
 
-    for (int c = 0; c < K; c++) {
-        cout << "Centroid " << c << ": ";
+void print_centroid_differences(
+    const char* implementation_name,
+    const CentroidRuns& runs,
+    const Centroids& reference
+) {
+    double worst_rmse = 0.0;
+    double worst_absolute_difference = 0.0;
+    std::size_t worst_rmse_run = 1;
+    std::size_t worst_absolute_run = 1;
 
-        for (int d = 0; d < dimensions; d++) {
-            cout << centroids[c][d] << " ";
+    for (std::size_t run = 0; run < runs.size(); run++) {
+        double squared_error_sum = 0.0;
+        std::size_t coordinate_count = 0;
+
+        for (std::size_t c = 0; c < reference.size(); c++) {
+            for (std::size_t d = 0; d < reference[c].size(); d++) {
+                const double difference = runs[run][c][d] - reference[c][d];
+
+                if (!std::isfinite(difference)) {
+                    throw runtime_error("Non-finite centroid difference.");
+                }
+
+                squared_error_sum += difference * difference;
+                coordinate_count++;
+
+                const double absolute_difference = std::abs(difference);
+                if (absolute_difference > worst_absolute_difference) {
+                    worst_absolute_difference = absolute_difference;
+                    worst_absolute_run = run + 1;
+                }
+            }
         }
 
-        cout << "\n";
+        // Compare RMSE per coordinate across measured runs.
+        const double rmse = std::sqrt(
+            squared_error_sum / static_cast<double>(coordinate_count)
+        );
+        if (rmse > worst_rmse) {
+            worst_rmse = rmse;
+            worst_rmse_run = run + 1;
+        }
     }
+
+    cout << implementation_name << " (" << runs.size() << " measured runs)\n";
+    cout << scientific << setprecision(6);
+    cout << "Worst RMSE per coordinate: " << worst_rmse
+         << " (run " << worst_rmse_run << ")\n";
+    cout << "Maximum absolute difference: " << worst_absolute_difference
+         << " (run " << worst_absolute_run << ")\n";
+    cout << defaultfloat;
 }
 
 int main() {
@@ -224,6 +277,11 @@ int main() {
         cout << "CPU affinity not explicitly restricted by this program.\n";
     }
     try {
+        if (RUN_OPENMP) {
+            omp_set_dynamic(0); // Keep OpenMP from automatically changing the number of threads.
+            omp_set_num_threads(OPENMP_THREADS);
+            cout << "Requested OpenMP threads: " << OPENMP_THREADS << "\n";
+        }
         for (const auto& dataset_path : select_datasets()) {
             // Load each dataset once before benchmarking either implementation.
             const auto points = load_dataset(dataset_path);
@@ -239,11 +297,29 @@ int main() {
             cout << "Clusters: " << K << "\n";
             cout << "Maximum iterations: " << MAX_ITERATIONS << "\n";
 
+            CentroidRuns sequential_runs;
+            CentroidRuns openmp_runs;
+
             if (RUN_SEQUENTIAL) {
-                benchmark("Sequential", kmeans, points);
+                sequential_runs = benchmark("Sequential", kmeans, points);
             }
             if (RUN_OPENMP) {
-                benchmark("OpenMP", kmeans_openmp, points);
+                openmp_runs = benchmark("OpenMP", kmeans_openmp, points);
+            }
+
+            // Use one reference for every measured run of this dataset.
+            const auto& reference = RUN_SEQUENTIAL
+                ? sequential_runs.front()
+                : openmp_runs.front();
+            cout << "\nCentroid comparison (reference: first "
+                 << (RUN_SEQUENTIAL ? "sequential" : "OpenMP")
+                 << " measured run)\n";
+
+            if (RUN_SEQUENTIAL) {
+                print_centroid_differences("Sequential", sequential_runs, reference);
+            }
+            if (RUN_OPENMP) {
+                print_centroid_differences("OpenMP", openmp_runs, reference);
             }
         }
 

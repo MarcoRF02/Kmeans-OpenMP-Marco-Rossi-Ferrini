@@ -18,6 +18,9 @@ int kmeans_openmp(
         bool changed = false;
 
         // Assign each point to its nearest centroid.
+        #pragma omp parallel for default(none) \
+        shared(points, centroids, labels, n, k, dimensions) \
+        schedule(static) reduction(|| : changed)
         for (int i = 0; i < n; i++) {
             int best_cluster = -1;
             double best_distance = 0.0;
