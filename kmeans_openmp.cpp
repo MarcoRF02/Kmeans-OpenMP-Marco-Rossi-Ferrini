@@ -18,12 +18,10 @@ int kmeans_openmp(
         max_threads, std::vector<int>(k, 0)
     );
 
-    // Store the coordinate sums for each thread and cluster.
-    std::vector<std::vector<std::vector<double>>> thread_sums(
-        max_threads,
-        std::vector<std::vector<double>>(
-            k, std::vector<double>(dimensions, 0.0)
-        )
+    // Store partial sums in one contiguous buffer: thread, cluster, coordinate.
+    std::vector<double> thread_sums(
+        static_cast<std::size_t>(max_threads) * k * dimensions,
+        0.0
     );
 
     int iterations = 0;
@@ -37,7 +35,7 @@ int kmeans_openmp(
                 thread_counts[t][c] = 0;
 
                 for (int d = 0; d < dimensions; d++) {
-                    thread_sums[t][c][d] = 0.0;
+                    thread_sums[(static_cast<std::size_t>(t) * k + c) * dimensions + d] = 0.0;
                 }
             }
         }
@@ -82,8 +80,7 @@ int kmeans_openmp(
                 thread_counts[t][best_cluster]++;
 
                 for (int d = 0; d < dimensions; d++) {
-                    thread_sums[t][best_cluster][d] +=
-                        points[static_cast<std::size_t>(i) * dimensions + d];
+                    thread_sums[(static_cast<std::size_t>(t) * k + best_cluster) * dimensions + d] += points[static_cast<std::size_t>(i) * dimensions + d];
                 }
             }
         }
@@ -102,7 +99,7 @@ int kmeans_openmp(
                     double total_sum = 0.0;
 
                     for (int t = 0; t < max_threads; t++) {
-                        total_sum += thread_sums[t][c][d];
+                        total_sum += thread_sums[(static_cast<std::size_t>(t) * k + c) * dimensions + d];
                     }
 
                     centroids[c][d] = total_sum / total_count;
