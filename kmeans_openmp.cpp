@@ -31,36 +31,6 @@ int kmeans_openmp(
     for (int iteration = 0; iteration < max_iterations; iteration++) {
         bool changed = false;
 
-        // Assign each point to its nearest centroid.
-        #pragma omp parallel for default(none) \
-            shared(points, centroids, labels, n, k, dimensions) \
-            schedule(static) reduction(|| : changed)
-        for (int i = 0; i < n; i++) {
-            int best_cluster = -1;
-            double best_distance = 0.0;
-
-            for (int c = 0; c < k; c++) {
-                double distance = 0.0;
-
-                // Compute the squared Euclidean distance.
-                for (int d = 0; d < dimensions; d++) {
-                    double difference = points[static_cast<std::size_t>(i) * dimensions + d] - centroids[c][d];
-                    distance += difference * difference;
-                }
-
-                // Ties are resolved by choosing the first centroid.
-                if (best_cluster == -1 || distance < best_distance) {
-                    best_distance = distance;
-                    best_cluster = c;
-                }
-            }
-
-            if (labels[i] != best_cluster) {
-                labels[i] = best_cluster;
-                changed = true;
-            }
-        }
-
         // Reset the partial accumulators for this iteration.
         for (int t = 0; t < max_threads; t++) {
             for (int c = 0; c < k; c++) {
@@ -72,19 +42,48 @@ int kmeans_openmp(
             }
         }
 
-        // Accumulate point coordinates in the thread's own buffers.
+        // Assign points and accumulate coordinates in each thread's buffers.
         #pragma omp parallel default(none) \
-            shared(points, labels, thread_counts, thread_sums, n, dimensions)
+            shared(points, centroids, labels, thread_counts, thread_sums, n, k, dimensions) \
+            reduction(|| : changed)
         {
             const int t = omp_get_thread_num();
 
             #pragma omp for schedule(static)
             for (int i = 0; i < n; i++) {
-                const int cluster = labels[i];
-                thread_counts[t][cluster]++;
+                int best_cluster = -1;
+                double best_distance = 0.0;
+
+                for (int c = 0; c < k; c++) {
+                    double distance = 0.0;
+
+                    // Compute the squared Euclidean distance.
+                    for (int d = 0; d < dimensions; d++) {
+                        double difference =
+                            points[static_cast<std::size_t>(i) * dimensions + d]
+                            - centroids[c][d];
+
+                        distance += difference * difference;
+                    }
+
+                    // Ties are resolved by choosing the first centroid.
+                    if (best_cluster == -1 || distance < best_distance) {
+                        best_distance = distance;
+                        best_cluster = c;
+                    }
+                }
+
+                if (labels[i] != best_cluster) {
+                    labels[i] = best_cluster;
+                    changed = true;
+                }
+
+                // Accumulate every point, even if its label did not change.
+                thread_counts[t][best_cluster]++;
 
                 for (int d = 0; d < dimensions; d++) {
-                    thread_sums[t][cluster][d] += points[static_cast<std::size_t>(i) * dimensions + d];
+                    thread_sums[t][best_cluster][d] +=
+                        points[static_cast<std::size_t>(i) * dimensions + d];
                 }
             }
         }
