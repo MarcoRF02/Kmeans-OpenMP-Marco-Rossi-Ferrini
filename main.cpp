@@ -5,6 +5,7 @@
 #include <windows.h>
 #include "kmeans_sequential.h"
 #include "kmeans_openmp.h"
+#include "kmeans_openmp_soa.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -20,8 +21,10 @@
 using namespace std;
 
 // Select the implementations and datasets before compiling.
-constexpr bool RUN_SEQUENTIAL = true;
+constexpr bool RUN_SEQUENTIAL = false;
 constexpr bool RUN_OPENMP = true;
+constexpr bool RUN_OPENMP_SOA = true;
+constexpr bool RUN_ANY_OPENMP = RUN_OPENMP || RUN_OPENMP_SOA;
 constexpr int OPENMP_THREADS = 4;
 constexpr bool RUN_ALL_DATASETS = false;
 constexpr const char* DATASET_DIRECTORY = "datasets";
@@ -34,7 +37,7 @@ constexpr int MEASURED_RUNS = 30;
 constexpr bool PIN_TO_CORE = true;
 constexpr int LOGICAL_CPU = 2;
 
-static_assert(RUN_SEQUENTIAL || RUN_OPENMP, "Enable at least one implementation.");
+static_assert(RUN_SEQUENTIAL || RUN_ANY_OPENMP, "Enable at least one implementation.");
 static_assert(WARMUP_RUNS >= 0, "WARMUP_RUNS cannot be negative.");
 static_assert(OPENMP_THREADS > 0, "OPENMP_THREADS must be positive.");
 static_assert(MEASURED_RUNS > 0, "MEASURED_RUNS must be positive.");
@@ -255,7 +258,7 @@ void print_centroid_differences(
 
 int main() {
     // Single-CPU affinity applies only to sequential-only benchmarks.
-    if (PIN_TO_CORE && !RUN_OPENMP) {
+    if (PIN_TO_CORE && !RUN_ANY_OPENMP) {
         DWORD_PTR affinity_mask = DWORD_PTR{1} << LOGICAL_CPU;
 
         if (!SetProcessAffinityMask(GetCurrentProcess(), affinity_mask)) {
@@ -270,13 +273,13 @@ int main() {
         cout << "CPU affinity not explicitly restricted by this program.\n";
     }
     try {
-        if (RUN_OPENMP) {
+        if (RUN_ANY_OPENMP) {
             omp_set_dynamic(0); // Keep OpenMP from automatically changing the number of threads.
             omp_set_num_threads(OPENMP_THREADS);
             cout << "Requested OpenMP threads: " << OPENMP_THREADS << "\n";
         }
         for (const auto& dataset_path : select_datasets()) {
-            // Load each dataset once before benchmarking either implementation.
+            // Load each dataset once before benchmarking the selected implementations.
             const auto points = load_dataset(dataset_path);
             const int n = static_cast<int>(points.size());
 
@@ -300,6 +303,19 @@ int main() {
                 }
             }
 
+            // Group the same coordinates by dimension, outside the measured region.
+            vector<double> soa_points;
+
+            if (RUN_OPENMP_SOA) {
+                soa_points.resize(static_cast<std::size_t>(n) * dimensions);
+
+                for (int d = 0; d < dimensions; d++) {
+                    for (int i = 0; i < n; i++) {
+                        soa_points[static_cast<std::size_t>(d) * n + i] = points[i][d];
+                    }
+                }
+            }
+
             cout << "\nDataset: " << dataset_path.generic_string() << "\n";
             cout << "Points: " << n << "\n";
             cout << "Dimensions: " << points.front().size() << "\n";
@@ -308,6 +324,7 @@ int main() {
 
             CentroidRuns sequential_runs;
             CentroidRuns openmp_runs;
+            CentroidRuns soa_runs;
 
             if (RUN_SEQUENTIAL) {
                 // Prepare the sequential working arrays before timing.
@@ -339,22 +356,40 @@ int main() {
                     );
                 };
 
-                openmp_runs = benchmark("OpenMP", run_openmp, points);
+                openmp_runs = benchmark("OpenMP AoS", run_openmp, points);
+            }
+
+            if (RUN_OPENMP_SOA) {
+                auto run_soa = [&soa_points, n, dimensions](
+                    Centroids& centroids,
+                    vector<int>& labels,
+                    int max_iterations
+                ) {
+                    return kmeans_openmp_soa(
+                        soa_points, n, dimensions,
+                        centroids, labels, max_iterations
+                    );
+                };
+
+                soa_runs = benchmark("OpenMP SoA", run_soa, points);
             }
 
             // Use one reference for every measured run of this dataset.
             const auto& reference = RUN_SEQUENTIAL
                 ? sequential_runs.front()
-                : openmp_runs.front();
+                : (RUN_OPENMP ? openmp_runs.front() : soa_runs.front());
             cout << "\nCentroid comparison (reference: first "
-                 << (RUN_SEQUENTIAL ? "sequential" : "OpenMP")
+                 << (RUN_SEQUENTIAL ? "sequential" : (RUN_OPENMP ? "OpenMP AoS" : "OpenMP SoA"))
                  << " measured run)\n";
 
             if (RUN_SEQUENTIAL) {
                 print_centroid_differences("Sequential", sequential_runs, reference);
             }
             if (RUN_OPENMP) {
-                print_centroid_differences("OpenMP", openmp_runs, reference);
+                print_centroid_differences("OpenMP AoS", openmp_runs, reference);
+            }
+            if (RUN_OPENMP_SOA) {
+                print_centroid_differences("OpenMP SoA", soa_runs, reference);
             }
         }
 
