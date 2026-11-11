@@ -1,18 +1,15 @@
 #include "kmeans_openmp.h"
 #include <omp.h>
+#include <cstddef>
 
 int kmeans_openmp(
-    const std::vector<std::vector<double>>& points,
+    const std::vector<double>& points,
+    int n,
+    int dimensions,
     std::vector<std::vector<double>>& centroids,
     std::vector<int>& labels,
-    // sums and counts are not used in the openmp version of the code
-    // They are still in the code to keep the signature of benchmark consistent
-    std::vector<std::vector<double>>& sums,
-    std::vector<int>& counts,
     int max_iterations
 ) {
-    int n = static_cast<int>(points.size());
-    int dimensions = static_cast<int>(points[0].size());
     int k = static_cast<int>(centroids.size());
 
     // Allocate one cluster counter per thread and cluster.
@@ -47,7 +44,7 @@ int kmeans_openmp(
 
                 // Compute the squared Euclidean distance.
                 for (int d = 0; d < dimensions; d++) {
-                    double difference = points[i][d] - centroids[c][d];
+                    double difference = points[static_cast<std::size_t>(i) * dimensions + d] - centroids[c][d];
                     distance += difference * difference;
                 }
 
@@ -87,7 +84,7 @@ int kmeans_openmp(
                 thread_counts[t][cluster]++;
 
                 for (int d = 0; d < dimensions; d++) {
-                    thread_sums[t][cluster][d] += points[i][d];
+                    thread_sums[t][cluster][d] += points[static_cast<std::size_t>(i) * dimensions + d];
                 }
             }
         }

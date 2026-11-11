@@ -101,9 +101,10 @@ vector<filesystem::path> select_datasets() {
 using Centroids = vector<vector<double>>;
 using CentroidRuns = vector<Centroids>;
 
+template <typename KMeansFunction>
 CentroidRuns benchmark(
     const char* implementation_name,
-    decltype(&kmeans) run_kmeans,
+    KMeansFunction run_kmeans,
     const vector<vector<double>>& points
 ) {
     const int n = static_cast<int>(points.size());
@@ -123,11 +124,6 @@ CentroidRuns benchmark(
         K, vector<double>(dimensions)
     );
     vector<int> labels(n, -1);
-
-    vector<vector<double>> sums(
-        K, vector<double>(dimensions, 0.0)
-    );
-    vector<int> counts(K, 0);
 
     vector<double> times(MEASURED_RUNS);
     vector<int> iteration_counts(MEASURED_RUNS);
@@ -154,11 +150,8 @@ CentroidRuns benchmark(
         auto start = chrono::steady_clock::now();
 
         int iterations = run_kmeans(
-            points,
             centroids,
             labels,
-            sums,
-            counts,
             MAX_ITERATIONS
         );
 
@@ -291,6 +284,22 @@ int main() {
                 throw runtime_error("Invalid K or iteration limit.");
             }
 
+            const int dimensions = static_cast<int>(points.front().size());
+
+            // Store all points in one contiguous buffer, keeping point order.
+            vector<double> flat_points;
+
+            if (RUN_OPENMP) {
+                flat_points.resize(static_cast<std::size_t>(n) * dimensions);
+
+                for (int i = 0; i < n; i++) {
+                    for (int d = 0; d < dimensions; d++) {
+                        flat_points[static_cast<std::size_t>(i) * dimensions + d] =
+                            points[i][d];
+                    }
+                }
+            }
+
             cout << "\nDataset: " << dataset_path.generic_string() << "\n";
             cout << "Points: " << n << "\n";
             cout << "Dimensions: " << points.front().size() << "\n";
@@ -301,10 +310,36 @@ int main() {
             CentroidRuns openmp_runs;
 
             if (RUN_SEQUENTIAL) {
-                sequential_runs = benchmark("Sequential", kmeans, points);
+                // Prepare the sequential working arrays before timing.
+                Centroids sums(K, vector<double>(dimensions, 0.0));
+                vector<int> counts(K, 0);
+
+                auto run_sequential = [&points, &sums, &counts](
+                    Centroids& centroids,
+                    vector<int>& labels,
+                    int max_iterations
+                ) {
+                    return kmeans(
+                        points, centroids, labels, sums, counts, max_iterations
+                    );
+                };
+
+                sequential_runs = benchmark("Sequential", run_sequential, points);
             }
+
             if (RUN_OPENMP) {
-                openmp_runs = benchmark("OpenMP", kmeans_openmp, points);
+                auto run_openmp = [&flat_points, n, dimensions](
+                    Centroids& centroids,
+                    vector<int>& labels,
+                    int max_iterations
+                ) {
+                    return kmeans_openmp(
+                        flat_points, n, dimensions,
+                        centroids, labels, max_iterations
+                    );
+                };
+
+                openmp_runs = benchmark("OpenMP", run_openmp, points);
             }
 
             // Use one reference for every measured run of this dataset.
