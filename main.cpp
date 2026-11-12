@@ -25,13 +25,13 @@ constexpr bool RUN_SEQUENTIAL = false;
 constexpr bool RUN_OPENMP = true;
 constexpr bool RUN_OPENMP_SOA = true;
 constexpr bool RUN_ANY_OPENMP = RUN_OPENMP || RUN_OPENMP_SOA;
-constexpr int OPENMP_THREADS = 4;
+constexpr int OPENMP_THREADS = 8;
 constexpr bool RUN_ALL_DATASETS = false;
 constexpr const char* DATASET_DIRECTORY = "datasets";
-constexpr const char* SELECTED_DATASET = "blobs_N100000_D16.txt";
+constexpr const char* SELECTED_DATASET = "blobs_N100000_D65.txt";
 
 constexpr int K = 10;
-constexpr int MAX_ITERATIONS = 100;
+constexpr int MAX_ITERATIONS = 300;
 constexpr int WARMUP_RUNS = 2;
 constexpr int MEASURED_RUNS = 30;
 constexpr bool PIN_TO_CORE = true;

@@ -63,7 +63,7 @@ int kmeans_openmp_soa(
             std::array<double, POINT_BLOCK_SIZE> best_distances;
             std::array<int, POINT_BLOCK_SIZE> best_clusters;
 
-            #pragma omp for schedule(static)
+            #pragma omp for schedule(static) nowait
             for (int block = 0; block < number_of_blocks; block++) {
                 const int first_point = block * POINT_BLOCK_SIZE;
                 const int remaining_points = n - first_point;
