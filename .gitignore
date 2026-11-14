@@ -24,3 +24,6 @@ out/
 
 # Local datasets
 datasets/
+
+# Local benchmark results
+results/

@@ -29,7 +29,7 @@ using namespace std;
 
 // Select the implementations and datasets before compiling.
 constexpr bool RUN_SEQUENTIAL = true;
-constexpr bool RUN_OPENMP = false;
+constexpr bool RUN_OPENMP = false; // this refers to AoS implementation
 constexpr bool RUN_OPENMP_SOA = true; // Static scheduling.
 constexpr bool RUN_OPENMP_SOA_DYNAMIC = true;
 constexpr bool RUN_ANY_SOA = RUN_OPENMP_SOA || RUN_OPENMP_SOA_DYNAMIC;
@@ -38,16 +38,16 @@ constexpr int OPENMP_THREADS = 24;
 constexpr bool RUN_ALL_THREAD_CONFIGURATIONS = true;
 constexpr int THREAD_COUNTS[] = {1, 2, 4, 6, 8, 16, 24, 32};
 constexpr bool MEASURE_ONE_THREAD_BASELINES = true;
-constexpr bool RUN_ALL_DATASETS = false;
+constexpr bool RUN_ALL_DATASETS = true;
 constexpr const char* DATASET_DIRECTORY = "datasets";
-constexpr const char* SELECTED_DATASET = "blobs_N100000_D64.txt";
+constexpr const char* SELECTED_DATASET = "blobs_N100000_D65.txt";
 
-constexpr int K = 10;
+constexpr int K = 30;
 constexpr bool RUN_ALL_CLUSTER_COUNTS = true;
 constexpr int CLUSTER_COUNTS[] = {10, 20, 30};
 constexpr int MAX_ITERATIONS = 300;
 constexpr int WARMUP_RUNS = 2;
-constexpr int MEASURED_RUNS = 30;
+constexpr int MEASURED_RUNS = 10;
 constexpr bool RESTRICT_CPU_AFFINITY = true;
 constexpr const char* RESULTS_DIRECTORY = "results";
 
