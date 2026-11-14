@@ -22,29 +22,54 @@ using namespace std;
 
 // Select the implementations and datasets before compiling.
 constexpr bool RUN_SEQUENTIAL = false;
-constexpr bool RUN_OPENMP = true;
+constexpr bool RUN_OPENMP = false;
 constexpr bool RUN_OPENMP_SOA = true;
 constexpr bool RUN_ANY_OPENMP = RUN_OPENMP || RUN_OPENMP_SOA;
 constexpr int OPENMP_THREADS = 8;
 constexpr bool RUN_ALL_DATASETS = false;
 constexpr const char* DATASET_DIRECTORY = "datasets";
-constexpr const char* SELECTED_DATASET = "blobs_N100000_D65.txt";
+constexpr const char* SELECTED_DATASET = "blobs_N100000_D64.txt";
 
 constexpr int K = 10;
 constexpr int MAX_ITERATIONS = 300;
 constexpr int WARMUP_RUNS = 2;
 constexpr int MEASURED_RUNS = 30;
-constexpr bool PIN_TO_CORE = true;
-constexpr int LOGICAL_CPU = 2;
+constexpr bool RESTRICT_CPU_AFFINITY = true;
 
 static_assert(RUN_SEQUENTIAL || RUN_ANY_OPENMP, "Enable at least one implementation.");
 static_assert(WARMUP_RUNS >= 0, "WARMUP_RUNS cannot be negative.");
 static_assert(OPENMP_THREADS > 0, "OPENMP_THREADS must be positive.");
 static_assert(MEASURED_RUNS > 0, "MEASURED_RUNS must be positive.");
 
-static_assert(LOGICAL_CPU >= 0 &&
-              LOGICAL_CPU < static_cast<int>(sizeof(DWORD_PTR) * 8),
-              "Invalid logical CPU index.");
+struct CpuConfiguration {
+    DWORD_PTR mask;
+    const char* description;
+};
+
+// CPU numbering verified on this machine; not a universal Intel mapping.
+constexpr CpuConfiguration select_cpu_configuration(int threads) {
+    switch (threads) {
+        case 1:  return {0x00000001ULL, "1 physical P-core"};
+        case 2:  return {0x00000005ULL, "2 physical P-cores"};
+        case 4:  return {0x00000055ULL, "4 physical P-cores"};
+        case 6:  return {0x00000555ULL, "6 physical P-cores"};
+        case 8:  return {0x00005555ULL, "8 physical P-cores"};
+        case 16: return {0x0000FFFFULL, "8 P-cores with Hyper-Threading"};
+        case 24: return {0xFFFF5555ULL, "24 physical cores: 8 P + 16 E"};
+        case 32: return {0xFFFFFFFFULL, "All 32 logical processors"};
+        default: return {0, "Unsupported configuration"};
+    }
+}
+
+constexpr CpuConfiguration CPU_CONFIGURATION =
+    select_cpu_configuration(OPENMP_THREADS);
+
+static_assert(sizeof(DWORD_PTR) == 8, "Use a 64-bit toolchain.");
+
+static_assert(
+    !RUN_ANY_OPENMP || CPU_CONFIGURATION.mask != 0,
+    "Supported thread counts: 1, 2, 4, 6, 8, 16, 24, 32."
+);
 
 
 vector<vector<double>> load_dataset(const filesystem::path& filename) {
@@ -257,9 +282,11 @@ void print_centroid_differences(
 }
 
 int main() {
-    // Single-CPU affinity applies only to sequential-only benchmarks.
-    if (PIN_TO_CORE && !RUN_ANY_OPENMP) {
-        DWORD_PTR affinity_mask = DWORD_PTR{1} << LOGICAL_CPU;
+    if (RESTRICT_CPU_AFFINITY) {
+        // Sequential-only runs use the same first P-core as the one-thread OpenMP case.
+        const DWORD_PTR affinity_mask = RUN_ANY_OPENMP
+            ? CPU_CONFIGURATION.mask
+            : DWORD_PTR{1};
 
         if (!SetProcessAffinityMask(GetCurrentProcess(), affinity_mask)) {
             cerr << "Cannot set CPU affinity. Windows error: "
@@ -267,8 +294,21 @@ int main() {
             return 1;
         }
 
-        cout << "Process restricted to logical CPU "
-             << LOGICAL_CPU << ".\n";
+        cout << "CPU configuration: "
+             << (RUN_ANY_OPENMP
+                 ? CPU_CONFIGURATION.description
+                 : "1 physical P-core")
+             << "\nAllowed logical CPUs:";
+
+        for (int cpu = 0;
+             cpu < static_cast<int>(sizeof(DWORD_PTR) * 8);
+             cpu++) {
+            if ((affinity_mask & (DWORD_PTR{1} << cpu)) != 0) {
+                cout << " " << cpu;
+            }
+             }
+
+        cout << "\n";
     } else {
         cout << "CPU affinity not explicitly restricted by this program.\n";
     }
