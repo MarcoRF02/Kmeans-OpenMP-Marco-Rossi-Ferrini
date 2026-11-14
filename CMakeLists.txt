@@ -15,7 +15,9 @@ add_executable(Marco_Rossi_Ferrini_Kmeans_OpenMP main.cpp
         kmeans_openmp.cpp
         kmeans_openmp.h
         kmeans_openmp_soa.h
-        kmeans_openmp_soa.cpp)
+        kmeans_openmp_soa.cpp
+        kmeans_openmp_soa_dynamic.cpp
+        kmeans_openmp_soa_dynamic.h)
 
 # Enable OpenMP for the executable
 target_link_libraries(Marco_Rossi_Ferrini_Kmeans_OpenMP

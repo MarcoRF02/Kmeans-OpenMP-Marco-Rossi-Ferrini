@@ -6,6 +6,7 @@
 #include "kmeans_sequential.h"
 #include "kmeans_openmp.h"
 #include "kmeans_openmp_soa.h"
+#include "kmeans_openmp_soa_dynamic.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -23,9 +24,11 @@ using namespace std;
 // Select the implementations and datasets before compiling.
 constexpr bool RUN_SEQUENTIAL = false;
 constexpr bool RUN_OPENMP = false;
-constexpr bool RUN_OPENMP_SOA = true;
-constexpr bool RUN_ANY_OPENMP = RUN_OPENMP || RUN_OPENMP_SOA;
-constexpr int OPENMP_THREADS = 8;
+constexpr bool RUN_OPENMP_SOA = true; // Static scheduling.
+constexpr bool RUN_OPENMP_SOA_DYNAMIC = true;
+constexpr bool RUN_ANY_SOA = RUN_OPENMP_SOA || RUN_OPENMP_SOA_DYNAMIC;
+constexpr bool RUN_ANY_OPENMP = RUN_OPENMP || RUN_ANY_SOA;
+constexpr int OPENMP_THREADS = 24;
 constexpr bool RUN_ALL_DATASETS = false;
 constexpr const char* DATASET_DIRECTORY = "datasets";
 constexpr const char* SELECTED_DATASET = "blobs_N100000_D64.txt";
@@ -306,7 +309,7 @@ int main() {
             if ((affinity_mask & (DWORD_PTR{1} << cpu)) != 0) {
                 cout << " " << cpu;
             }
-             }
+        }
 
         cout << "\n";
     } else {
@@ -346,7 +349,7 @@ int main() {
             // Group the same coordinates by dimension, outside the measured region.
             vector<double> soa_points;
 
-            if (RUN_OPENMP_SOA) {
+            if (RUN_ANY_SOA) {
                 soa_points.resize(static_cast<std::size_t>(n) * dimensions);
 
                 for (int d = 0; d < dimensions; d++) {
@@ -365,6 +368,7 @@ int main() {
             CentroidRuns sequential_runs;
             CentroidRuns openmp_runs;
             CentroidRuns soa_runs;
+            CentroidRuns soa_dynamic_runs;
 
             if (RUN_SEQUENTIAL) {
                 // Prepare the sequential working arrays before timing.
@@ -411,15 +415,33 @@ int main() {
                     );
                 };
 
-                soa_runs = benchmark("OpenMP SoA", run_soa, points);
+                soa_runs = benchmark("OpenMP SoA static", run_soa, points);
+            }
+
+            if (RUN_OPENMP_SOA_DYNAMIC) {
+                auto run_soa_dynamic = [&soa_points, n, dimensions](
+                    Centroids& centroids,
+                    vector<int>& labels,
+                    int max_iterations
+                ) {
+                    return kmeans_openmp_soa_dynamic(
+                        soa_points, n, dimensions,
+                        centroids, labels, max_iterations
+                    );
+                };
+
+                soa_dynamic_runs = benchmark("OpenMP SoA dynamic", run_soa_dynamic, points);
             }
 
             // Use one reference for every measured run of this dataset.
             const auto& reference = RUN_SEQUENTIAL
                 ? sequential_runs.front()
-                : (RUN_OPENMP ? openmp_runs.front() : soa_runs.front());
+                : (RUN_OPENMP ? openmp_runs.front()
+                              : (RUN_OPENMP_SOA ? soa_runs.front() : soa_dynamic_runs.front()));
             cout << "\nCentroid comparison (reference: first "
-                 << (RUN_SEQUENTIAL ? "sequential" : (RUN_OPENMP ? "OpenMP AoS" : "OpenMP SoA"))
+                 << (RUN_SEQUENTIAL ? "sequential"
+                                     : (RUN_OPENMP ? "OpenMP AoS"
+                                                   : (RUN_OPENMP_SOA ? "OpenMP SoA static" : "OpenMP SoA dynamic")))
                  << " measured run)\n";
 
             if (RUN_SEQUENTIAL) {
@@ -429,7 +451,10 @@ int main() {
                 print_centroid_differences("OpenMP AoS", openmp_runs, reference);
             }
             if (RUN_OPENMP_SOA) {
-                print_centroid_differences("OpenMP SoA", soa_runs, reference);
+                print_centroid_differences("OpenMP SoA static", soa_runs, reference);
+            }
+            if (RUN_OPENMP_SOA_DYNAMIC) {
+                print_centroid_differences("OpenMP SoA dynamic", soa_dynamic_runs, reference);
             }
         }
 
