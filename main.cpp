@@ -18,26 +18,38 @@
 #include <stdexcept>
 #include <vector>
 #include <omp.h>
+#include <locale>
+#include <numeric>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <utility>
 
 using namespace std;
 
 // Select the implementations and datasets before compiling.
-constexpr bool RUN_SEQUENTIAL = false;
+constexpr bool RUN_SEQUENTIAL = true;
 constexpr bool RUN_OPENMP = false;
 constexpr bool RUN_OPENMP_SOA = true; // Static scheduling.
 constexpr bool RUN_OPENMP_SOA_DYNAMIC = true;
 constexpr bool RUN_ANY_SOA = RUN_OPENMP_SOA || RUN_OPENMP_SOA_DYNAMIC;
 constexpr bool RUN_ANY_OPENMP = RUN_OPENMP || RUN_ANY_SOA;
 constexpr int OPENMP_THREADS = 24;
+constexpr bool RUN_ALL_THREAD_CONFIGURATIONS = true;
+constexpr int THREAD_COUNTS[] = {1, 2, 4, 6, 8, 16, 24, 32};
+constexpr bool MEASURE_ONE_THREAD_BASELINES = true;
 constexpr bool RUN_ALL_DATASETS = false;
 constexpr const char* DATASET_DIRECTORY = "datasets";
 constexpr const char* SELECTED_DATASET = "blobs_N100000_D64.txt";
 
 constexpr int K = 10;
+constexpr bool RUN_ALL_CLUSTER_COUNTS = true;
+constexpr int CLUSTER_COUNTS[] = {10, 20, 30};
 constexpr int MAX_ITERATIONS = 300;
 constexpr int WARMUP_RUNS = 2;
 constexpr int MEASURED_RUNS = 30;
 constexpr bool RESTRICT_CPU_AFFINITY = true;
+constexpr const char* RESULTS_DIRECTORY = "results";
 
 static_assert(RUN_SEQUENTIAL || RUN_ANY_OPENMP, "Enable at least one implementation.");
 static_assert(WARMUP_RUNS >= 0, "WARMUP_RUNS cannot be negative.");
@@ -70,9 +82,61 @@ constexpr CpuConfiguration CPU_CONFIGURATION =
 static_assert(sizeof(DWORD_PTR) == 8, "Use a 64-bit toolchain.");
 
 static_assert(
-    !RUN_ANY_OPENMP || CPU_CONFIGURATION.mask != 0,
+    !RUN_ANY_OPENMP || RUN_ALL_THREAD_CONFIGURATIONS || CPU_CONFIGURATION.mask != 0,
     "Supported thread counts: 1, 2, 4, 6, 8, 16, 24, 32."
 );
+
+vector<int> select_thread_counts() {
+    vector<int> selected;
+    if (RUN_ALL_THREAD_CONFIGURATIONS) {
+        for (int threads : THREAD_COUNTS) {
+            selected.push_back(threads);
+        }
+    } else {
+        selected.push_back(OPENMP_THREADS);
+    }
+
+    vector<int> checked;
+    for (int threads : selected) {
+        if (select_cpu_configuration(threads).mask == 0) {
+            throw runtime_error("Unsupported value in the thread configurations.");
+        }
+        if (find(checked.begin(), checked.end(), threads) != checked.end()) {
+            throw runtime_error("Duplicate value in the thread configurations.");
+        }
+        checked.push_back(threads);
+    }
+    if (selected.empty()) {
+        throw runtime_error("Select at least one thread configuration.");
+    }
+    return selected;
+}
+
+vector<int> select_cluster_counts() {
+    vector<int> selected;
+    if (RUN_ALL_CLUSTER_COUNTS) {
+        for (int clusters : CLUSTER_COUNTS) {
+            selected.push_back(clusters);
+        }
+    } else {
+        selected.push_back(K);
+    }
+
+    vector<int> checked;
+    for (int clusters : selected) {
+        if (clusters <= 0) {
+            throw runtime_error("The number of clusters must be positive.");
+        }
+        if (find(checked.begin(), checked.end(), clusters) != checked.end()) {
+            throw runtime_error("Duplicate value in the cluster configurations.");
+        }
+        checked.push_back(clusters);
+    }
+    if (selected.empty()) {
+        throw runtime_error("Select at least one cluster configuration.");
+    }
+    return selected;
+}
 
 
 vector<vector<double>> load_dataset(const filesystem::path& filename) {
@@ -132,27 +196,121 @@ vector<filesystem::path> select_datasets() {
 using Centroids = vector<vector<double>>;
 using CentroidRuns = vector<Centroids>;
 
+struct TimeStatistics {
+    double median;
+    double mean;
+    double standard_deviation;
+    double minimum;
+    double maximum;
+};
+
+struct BenchmarkResult {
+    TimeStatistics statistics{};
+    vector<double> times;
+    vector<int> iteration_counts;
+    CentroidRuns centroids;
+};
+
+struct CentroidDifference {
+    double worst_rmse;
+    double maximum_absolute_difference;
+};
+
+struct PerformanceMetrics {
+    optional<double> speedup_vs_sequential;
+    optional<double> relative_speedup;
+    optional<double> relative_efficiency;
+    optional<bool> iteration_range_matches_sequential;
+    optional<bool> iteration_range_matches_one_thread;
+};
+
+TimeStatistics calculate_statistics(const vector<double>& times) {
+    if (times.empty()) {
+        throw runtime_error("Cannot calculate statistics without measurements.");
+    }
+
+    vector<double> sorted_times = times;
+    sort(sorted_times.begin(), sorted_times.end());
+    const size_t middle = sorted_times.size() / 2;
+    const double median = sorted_times.size() % 2 == 0
+        ? (sorted_times[middle - 1] + sorted_times[middle]) / 2.0
+        : sorted_times[middle];
+
+    const double mean = accumulate(times.begin(), times.end(), 0.0)
+        / static_cast<double>(times.size());
+
+    double squared_deviations = 0.0;
+    for (double time : times) {
+        const double deviation = time - mean;
+        squared_deviations += deviation * deviation;
+    }
+
+    // Use the sample standard deviation; one measurement has no estimated spread.
+    const double standard_deviation = times.size() > 1
+        ? sqrt(squared_deviations / static_cast<double>(times.size() - 1))
+        : 0.0;
+
+    return {median, mean, standard_deviation, sorted_times.front(), sorted_times.back()};
+}
+
+pair<int, int> iteration_range(const BenchmarkResult& result) {
+    const auto limits = minmax_element(
+        result.iteration_counts.begin(), result.iteration_counts.end()
+    );
+    return {*limits.first, *limits.second};
+}
+
+PerformanceMetrics calculate_performance(
+    const BenchmarkResult& result,
+    const BenchmarkResult* sequential_reference,
+    const BenchmarkResult* one_thread_reference,
+    int threads
+) {
+    PerformanceMetrics metrics;
+    const double median = result.statistics.median;
+
+    if (sequential_reference != nullptr) {
+        metrics.iteration_range_matches_sequential =
+            iteration_range(result) == iteration_range(*sequential_reference);
+        if (median > 0.0 && sequential_reference->statistics.median > 0.0) {
+            metrics.speedup_vs_sequential = sequential_reference->statistics.median / median;
+        }
+    }
+
+    if (one_thread_reference != nullptr) {
+        metrics.iteration_range_matches_one_thread =
+            iteration_range(result) == iteration_range(*one_thread_reference);
+        if (median > 0.0 && one_thread_reference->statistics.median > 0.0) {
+            metrics.relative_speedup = one_thread_reference->statistics.median / median;
+            metrics.relative_efficiency = *metrics.relative_speedup / threads;
+        }
+    }
+
+    return metrics;
+}
+
 template <typename KMeansFunction>
-CentroidRuns benchmark(
+BenchmarkResult benchmark(
     const char* implementation_name,
     KMeansFunction run_kmeans,
-    const vector<vector<double>>& points
+    const vector<vector<double>>& points,
+    int k
 ) {
     const int n = static_cast<int>(points.size());
     const int dimensions = static_cast<int>(points.front().size());
 
-    // Use the first K points as fixed initial centroids.
+    // Use the first k points as fixed initial centroids.
     vector<vector<double>> initial_centroids(
-        K, vector<double>(dimensions)
+        k, vector<double>(dimensions)
     );
 
-    for (int c = 0; c < K; c++) {
+    for (int c = 0; c < k; c++) {
         initial_centroids[c] = points[c];
     }
 
     // Allocate working memory outside the measured region.
     vector<vector<double>> centroids(
-        K, vector<double>(dimensions)
+        k, vector<double>(dimensions)
     );
     vector<int> labels(n, -1);
 
@@ -167,7 +325,7 @@ CentroidRuns benchmark(
 
     for (int run = 0; run < WARMUP_RUNS + MEASURED_RUNS; run++) {
         // Restore the same initial state before every run.
-        for (int c = 0; c < K; c++) {
+        for (int c = 0; c < k; c++) {
             for (int d = 0; d < dimensions; d++) {
                 centroids[c][d] = initial_centroids[c][d];
             }
@@ -201,19 +359,8 @@ CentroidRuns benchmark(
         }
     }
 
-    // Sort a copy of the measured execution times.
-    vector<double> sorted_times = times;
-    sort(sorted_times.begin(), sorted_times.end());
-
-    // Calculate the median for either an even or odd number of runs.
-    int middle = static_cast<int>(sorted_times.size()) / 2;
-    double median;
-
-    if (sorted_times.size() % 2 == 0) {
-        median = (sorted_times[middle - 1] + sorted_times[middle]) / 2.0;
-    } else {
-        median = sorted_times[middle];
-    }
+    // Calculate all statistics after the measured runs have finished.
+    const TimeStatistics statistics = calculate_statistics(times);
 
     // Print results outside the measured region.
     cout << fixed << setprecision(6);
@@ -225,14 +372,20 @@ CentroidRuns benchmark(
              << "\n";
     }
 
-    cout << "\nMedian time: " << median << " s\n";
-    cout << "Minimum time: " << sorted_times.front() << " s\n";
-    cout << "Maximum time: " << sorted_times.back() << " s\n";
+    cout << "\nMedian time: " << statistics.median << " s\n";
+    cout << "Minimum time: " << statistics.minimum << " s\n";
+    cout << "Maximum time: " << statistics.maximum << " s\n";
 
-    return measured_centroids;
+    cout << "Mean time: " << statistics.mean << " s\n";
+    cout << "Sample standard deviation: " << statistics.standard_deviation << " s\n";
+    if (*max_element(iteration_counts.begin(), iteration_counts.end()) >= MAX_ITERATIONS) {
+        cout << "NOTE: a run reached the iteration limit; convergence at that limit is not distinguished.\n";
+    }
+
+    return {statistics, std::move(times), std::move(iteration_counts), std::move(measured_centroids)};
 }
 
-void print_centroid_differences(
+CentroidDifference print_centroid_differences(
     const char* implementation_name,
     const CentroidRuns& runs,
     const Centroids& reference
@@ -282,182 +435,336 @@ void print_centroid_differences(
     cout << "Maximum absolute difference: " << worst_absolute_difference
          << " (run " << worst_absolute_run << ")\n";
     cout << defaultfloat;
+    return {worst_rmse, worst_absolute_difference};
+}
+
+// All functions below run outside the measured K-Means call.
+void configure_execution(int threads, DWORD_PTR original_mask) {
+    const CpuConfiguration configuration = select_cpu_configuration(threads);
+    if (configuration.mask == 0) {
+        throw runtime_error("Unsupported thread configuration.");
+    }
+
+    const DWORD_PTR mask = RESTRICT_CPU_AFFINITY ? configuration.mask : original_mask;
+    if ((mask & original_mask) != mask) {
+        throw runtime_error("The selected CPUs are outside the process's initial allowed CPUs.");
+    }
+    if (!SetProcessAffinityMask(GetCurrentProcess(), mask)) {
+        throw runtime_error("Cannot set CPU affinity. Windows error: " + to_string(GetLastError()));
+    }
+
+    omp_set_dynamic(0); // Keep OpenMP from automatically changing the number of threads.
+    omp_set_num_threads(threads);
+
+    cout << "\nExecution configuration: "
+         << (RESTRICT_CPU_AFFINITY ? configuration.description : "Windows scheduling without an added affinity restriction")
+         << "\nRequested threads: " << threads << "\nAllowed logical CPUs:";
+    for (int cpu = 0; cpu < static_cast<int>(sizeof(DWORD_PTR) * 8); cpu++) {
+        if ((mask & (DWORD_PTR{1} << cpu)) != 0) {
+            cout << " " << cpu;
+        }
+    }
+    cout << "\n";
+}
+
+filesystem::path create_result_directory() {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    ostringstream name;
+    name << "benchmark_" << setfill('0')
+         << setw(4) << time.wYear << setw(2) << time.wMonth << setw(2) << time.wDay
+         << "_" << setw(2) << time.wHour << setw(2) << time.wMinute << setw(2) << time.wSecond
+         << "_" << setw(3) << time.wMilliseconds << "_" << GetCurrentProcessId();
+
+    const filesystem::path root = RESULTS_DIRECTORY;
+    filesystem::create_directories(root);
+    const filesystem::path base = root / name.str();
+    filesystem::path directory = base;
+    int suffix = 0;
+    while (!filesystem::create_directory(directory)) {
+        directory = base.string() + "_" + to_string(++suffix);
+    }
+    return directory;
+}
+
+string csv_text(const string& text) {
+    string escaped = "\"";
+    for (char character : text) {
+        if (character == '"') {
+            escaped += '"';
+        }
+        escaped += character;
+    }
+    return escaped + '"';
+}
+
+void write_csv_parameters(
+    ostream& output,
+    const filesystem::path& dataset,
+    int n,
+    int dimensions,
+    int k,
+    const char* implementation,
+    const char* role,
+    int threads,
+    DWORD_PTR original_mask
+) {
+    const CpuConfiguration configuration = select_cpu_configuration(threads);
+    const DWORD_PTR mask = RESTRICT_CPU_AFFINITY ? configuration.mask : original_mask;
+    output << csv_text(dataset.generic_string()) << ',' << n << ',' << dimensions << ',' << k << ','
+           << csv_text(implementation) << ',' << csv_text(role) << ',' << threads << ','
+           << RESTRICT_CPU_AFFINITY << ',' << mask << ','
+           << csv_text(RESTRICT_CPU_AFFINITY ? configuration.description : "Unrestricted") << ','
+           << WARMUP_RUNS << ',' << MEASURED_RUNS << ',' << MAX_ITERATIONS;
+}
+
+template <typename Value>
+void write_optional(ostream& output, const optional<Value>& value) {
+    if (value.has_value()) {
+        output << *value;
+    }
+}
+
+void print_performance(const PerformanceMetrics& metrics) {
+    cout << fixed << setprecision(6);
+    if (metrics.speedup_vs_sequential.has_value()) {
+        cout << "Speedup vs sequential: " << *metrics.speedup_vs_sequential << "\n";
+    }
+    if (metrics.relative_speedup.has_value()) {
+        cout << "Relative speedup vs same version at 1 thread: " << *metrics.relative_speedup << "\n";
+        cout << "Relative parallel efficiency: " << *metrics.relative_efficiency
+             << " (" << *metrics.relative_efficiency * 100.0 << "%)\n";
+    }
+    if ((metrics.iteration_range_matches_sequential.has_value() && !*metrics.iteration_range_matches_sequential)
+        || (metrics.iteration_range_matches_one_thread.has_value() && !*metrics.iteration_range_matches_one_thread)) {
+        cout << "NOTE: iteration counts differ from a reference; consider this when interpreting speedup.\n";
+    }
+}
+
+void save_result(
+    ofstream& runs_csv,
+    ofstream& summary_csv,
+    const filesystem::path& dataset,
+    int n,
+    int dimensions,
+    int k,
+    const char* implementation,
+    const char* role,
+    int threads,
+    DWORD_PTR original_mask,
+    const BenchmarkResult& result,
+    const PerformanceMetrics& metrics,
+    const CentroidDifference& difference
+) {
+    for (size_t run = 0; run < result.times.size(); run++) {
+        write_csv_parameters(runs_csv, dataset, n, dimensions, k, implementation, role, threads, original_mask);
+        runs_csv << ',' << run + 1 << ',' << result.times[run] << ',' << result.iteration_counts[run]
+                 << ',' << (result.iteration_counts[run] >= MAX_ITERATIONS) << '\n';
+    }
+
+    const auto& statistics = result.statistics;
+    const auto limits = iteration_range(result);
+    write_csv_parameters(summary_csv, dataset, n, dimensions, k, implementation, role, threads, original_mask);
+    summary_csv << ',' << statistics.median << ',' << statistics.mean << ',' << statistics.standard_deviation
+                << ',' << statistics.minimum << ',' << statistics.maximum << ',' << limits.first << ',' << limits.second
+                << ',' << (limits.second >= MAX_ITERATIONS) << ',';
+    write_optional(summary_csv, metrics.speedup_vs_sequential);
+    summary_csv << ',';
+    write_optional(summary_csv, metrics.relative_speedup);
+    summary_csv << ',';
+    write_optional(summary_csv, metrics.relative_efficiency);
+    summary_csv << ',';
+    write_optional(summary_csv, metrics.iteration_range_matches_sequential);
+    summary_csv << ',';
+    write_optional(summary_csv, metrics.iteration_range_matches_one_thread);
+    summary_csv << ',' << difference.worst_rmse << ',' << difference.maximum_absolute_difference << '\n';
+    runs_csv.flush();
+    summary_csv.flush();
 }
 
 int main() {
-    if (RESTRICT_CPU_AFFINITY) {
-        // Sequential-only runs use the same first P-core as the one-thread OpenMP case.
-        const DWORD_PTR affinity_mask = RUN_ANY_OPENMP
-            ? CPU_CONFIGURATION.mask
-            : DWORD_PTR{1};
-
-        if (!SetProcessAffinityMask(GetCurrentProcess(), affinity_mask)) {
-            cerr << "Cannot set CPU affinity. Windows error: "
-                 << GetLastError() << "\n";
-            return 1;
-        }
-
-        cout << "CPU configuration: "
-             << (RUN_ANY_OPENMP
-                 ? CPU_CONFIGURATION.description
-                 : "1 physical P-core")
-             << "\nAllowed logical CPUs:";
-
-        for (int cpu = 0;
-             cpu < static_cast<int>(sizeof(DWORD_PTR) * 8);
-             cpu++) {
-            if ((affinity_mask & (DWORD_PTR{1} << cpu)) != 0) {
-                cout << " " << cpu;
-            }
-        }
-
-        cout << "\n";
-    } else {
-        cout << "CPU affinity not explicitly restricted by this program.\n";
-    }
     try {
-        if (RUN_ANY_OPENMP) {
-            omp_set_dynamic(0); // Keep OpenMP from automatically changing the number of threads.
-            omp_set_num_threads(OPENMP_THREADS);
-            cout << "Requested OpenMP threads: " << OPENMP_THREADS << "\n";
+        DWORD_PTR original_mask = 0;
+        DWORD_PTR system_mask = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &original_mask, &system_mask)) {
+            throw runtime_error("Cannot read the initial CPU affinity.");
         }
+        const vector<int> thread_counts = select_thread_counts();
+        const vector<int> cluster_counts = select_cluster_counts();
+        const bool one_thread_selected =
+            find(thread_counts.begin(), thread_counts.end(), 1) != thread_counts.end();
+
+        const filesystem::path result_directory = create_result_directory();
+        ofstream runs_csv;
+        ofstream summary_csv;
+        runs_csv.exceptions(ios::failbit | ios::badbit);
+        summary_csv.exceptions(ios::failbit | ios::badbit);
+        runs_csv.open(result_directory / "runs.csv");
+        summary_csv.open(result_directory / "summary.csv");
+        runs_csv.imbue(locale::classic());
+        summary_csv.imbue(locale::classic());
+        runs_csv << setprecision(17);
+        summary_csv << setprecision(17);
+
+        const char* common_columns = "dataset,N,D,K,implementation,role,requested_threads,affinity_restricted,allowed_cpu_mask,cpu_configuration,warmups,measured_runs,max_iterations";
+        runs_csv << common_columns << ",run,wall_seconds,iterations,iteration_limit_reached\n";
+        summary_csv << common_columns
+            << ",median_s,mean_s,sample_stddev_s,min_s,max_s,min_iterations,max_run_iterations,any_run_at_iteration_limit"
+            << ",speedup_vs_sequential,relative_speedup,relative_efficiency"
+            << ",iteration_range_matches_sequential,iteration_range_matches_one_thread,worst_rmse,max_centroid_difference\n";
+
+        cout << "Results directory: " << filesystem::absolute(result_directory).string() << "\n";
+        cout << "Cluster configurations:";
+        for (int clusters : cluster_counts) {
+            cout << " " << clusters;
+        }
+        cout << "\n";
+        if (RUN_ANY_OPENMP) {
+            cout << "OpenMP thread configurations:";
+            for (int threads : thread_counts) {
+                cout << " " << threads;
+            }
+            cout << "\n";
+        }
+        if (!RUN_SEQUENTIAL && RUN_ANY_OPENMP) {
+            cout << "Sequential disabled: speedup vs sequential will be unavailable.\n";
+        }
+        if (!MEASURE_ONE_THREAD_BASELINES && RUN_ANY_OPENMP && !one_thread_selected) {
+            cout << "One-thread references disabled: relative speedup and efficiency will be unavailable.\n";
+        }
+
         for (const auto& dataset_path : select_datasets()) {
-            // Load each dataset once before benchmarking the selected implementations.
             const auto points = load_dataset(dataset_path);
             const int n = static_cast<int>(points.size());
-
-            if (K <= 0 || K > n || MAX_ITERATIONS <= 0) {
-                throw runtime_error("Invalid K or iteration limit.");
+            const int dimensions = static_cast<int>(points.front().size());
+            if (MAX_ITERATIONS <= 0) {
+                throw runtime_error("Invalid iteration limit.");
+            }
+            for (int clusters : cluster_counts) {
+                if (clusters > n) {
+                    throw runtime_error("K exceeds the number of points in " + dataset_path.string());
+                }
             }
 
-            const int dimensions = static_cast<int>(points.front().size());
-
-            // Store all points in one contiguous buffer, keeping point order.
+            // Prepare both layouts outside all measured regions.
             vector<double> flat_points;
-
             if (RUN_OPENMP) {
-                flat_points.resize(static_cast<std::size_t>(n) * dimensions);
-
+                flat_points.resize(static_cast<size_t>(n) * dimensions);
                 for (int i = 0; i < n; i++) {
                     for (int d = 0; d < dimensions; d++) {
-                        flat_points[static_cast<std::size_t>(i) * dimensions + d] =
-                            points[i][d];
+                        flat_points[static_cast<size_t>(i) * dimensions + d] = points[i][d];
                     }
                 }
             }
 
-            // Group the same coordinates by dimension, outside the measured region.
             vector<double> soa_points;
-
             if (RUN_ANY_SOA) {
-                soa_points.resize(static_cast<std::size_t>(n) * dimensions);
-
+                soa_points.resize(static_cast<size_t>(n) * dimensions);
                 for (int d = 0; d < dimensions; d++) {
                     for (int i = 0; i < n; i++) {
-                        soa_points[static_cast<std::size_t>(d) * n + i] = points[i][d];
+                        soa_points[static_cast<size_t>(d) * n + i] = points[i][d];
                     }
                 }
             }
 
-            cout << "\nDataset: " << dataset_path.generic_string() << "\n";
-            cout << "Points: " << n << "\n";
-            cout << "Dimensions: " << points.front().size() << "\n";
-            cout << "Clusters: " << K << "\n";
-            cout << "Maximum iterations: " << MAX_ITERATIONS << "\n";
+            cout << "\nDataset: " << dataset_path.generic_string()
+                 << "\nPoints: " << n << "\nDimensions: " << dimensions
+                 << "\nMaximum iterations: " << MAX_ITERATIONS << "\n";
 
-            CentroidRuns sequential_runs;
-            CentroidRuns openmp_runs;
-            CentroidRuns soa_runs;
-            CentroidRuns soa_dynamic_runs;
+            for (int k : cluster_counts) {
+                cout << "\nClusters: " << k << "\n";
 
-            if (RUN_SEQUENTIAL) {
-                // Prepare the sequential working arrays before timing.
-                Centroids sums(K, vector<double>(dimensions, 0.0));
-                vector<int> counts(K, 0);
+                BenchmarkResult sequential_result;
+                Centroids reference_centroids;
+                string reference_name;
 
-                auto run_sequential = [&points, &sums, &counts](
-                    Centroids& centroids,
-                    vector<int>& labels,
-                    int max_iterations
-                ) {
-                    return kmeans(
-                        points, centroids, labels, sums, counts, max_iterations
+                // Summaries, numerical comparisons and CSV output are outside the timer.
+                auto record_result = [&](const char* implementation, const char* role, int threads,
+                                         const BenchmarkResult& result, const BenchmarkResult* one_thread_reference) {
+                    if (reference_centroids.empty()) {
+                        reference_centroids = result.centroids.front();
+                        reference_name = implementation;
+                    }
+
+                    cout << "\nCentroid reference: first measured run of " << reference_name << "\n";
+                    const CentroidDifference difference = print_centroid_differences(
+                        implementation, result.centroids, reference_centroids
                     );
+                    const PerformanceMetrics metrics = calculate_performance(
+                        result, RUN_SEQUENTIAL ? &sequential_result : nullptr,
+                        one_thread_reference, threads
+                    );
+                    print_performance(metrics);
+                    save_result(runs_csv, summary_csv, dataset_path, n, dimensions, k, implementation, role,
+                                threads, original_mask, result, metrics, difference);
                 };
 
-                sequential_runs = benchmark("Sequential", run_sequential, points);
-            }
+                if (RUN_SEQUENTIAL) {
+                    // The baseline is pinned to CPU 0 when affinity restriction is enabled.
+                    configure_execution(1, original_mask);
+                    Centroids sums(k, vector<double>(dimensions, 0.0));
+                    vector<int> counts(k, 0);
+                    auto run_sequential = [&points, &sums, &counts](
+                        Centroids& centroids, vector<int>& labels, int max_iterations
+                    ) {
+                        return kmeans(points, centroids, labels, sums, counts, max_iterations);
+                    };
+                    sequential_result = benchmark("Sequential", run_sequential, points, k);
+                    record_result("Sequential", "sequential_reference", 1, sequential_result, nullptr);
+                }
 
-            if (RUN_OPENMP) {
-                auto run_openmp = [&flat_points, n, dimensions](
-                    Centroids& centroids,
-                    vector<int>& labels,
-                    int max_iterations
-                ) {
-                    return kmeans_openmp(
-                        flat_points, n, dimensions,
-                        centroids, labels, max_iterations
-                    );
+                // Each implementation uses its own one-thread reference.
+                auto run_parallel_cases = [&](const char* implementation, auto run_kmeans) {
+                    BenchmarkResult one_thread_result;
+                    if (one_thread_selected || MEASURE_ONE_THREAD_BASELINES) {
+                        configure_execution(1, original_mask);
+                        one_thread_result = benchmark(implementation, run_kmeans, points, k);
+                        record_result(implementation,
+                                      one_thread_selected ? "one_thread_reference_and_selected" : "one_thread_reference",
+                                      1, one_thread_result, &one_thread_result);
+                    }
+
+                    for (int threads : thread_counts) {
+                        if (threads == 1) {
+                            continue; // Already measured and reused as the reference.
+                        }
+                        configure_execution(threads, original_mask);
+                        const BenchmarkResult selected_result = benchmark(implementation, run_kmeans, points, k);
+                        record_result(implementation, "selected_configuration", threads, selected_result,
+                                      one_thread_result.times.empty() ? nullptr : &one_thread_result);
+                    }
                 };
 
-                openmp_runs = benchmark("OpenMP AoS", run_openmp, points);
-            }
+                if (RUN_OPENMP) {
+                    auto run_openmp = [&flat_points, n, dimensions](
+                        Centroids& centroids, vector<int>& labels, int max_iterations
+                    ) {
+                        return kmeans_openmp(flat_points, n, dimensions, centroids, labels, max_iterations);
+                    };
+                    run_parallel_cases("OpenMP AoS", run_openmp);
+                }
 
-            if (RUN_OPENMP_SOA) {
-                auto run_soa = [&soa_points, n, dimensions](
-                    Centroids& centroids,
-                    vector<int>& labels,
-                    int max_iterations
-                ) {
-                    return kmeans_openmp_soa(
-                        soa_points, n, dimensions,
-                        centroids, labels, max_iterations
-                    );
-                };
+                if (RUN_OPENMP_SOA) {
+                    auto run_soa = [&soa_points, n, dimensions](
+                        Centroids& centroids, vector<int>& labels, int max_iterations
+                    ) {
+                        return kmeans_openmp_soa(soa_points, n, dimensions, centroids, labels, max_iterations);
+                    };
+                    run_parallel_cases("OpenMP SoA static", run_soa);
+                }
 
-                soa_runs = benchmark("OpenMP SoA static", run_soa, points);
-            }
-
-            if (RUN_OPENMP_SOA_DYNAMIC) {
-                auto run_soa_dynamic = [&soa_points, n, dimensions](
-                    Centroids& centroids,
-                    vector<int>& labels,
-                    int max_iterations
-                ) {
-                    return kmeans_openmp_soa_dynamic(
-                        soa_points, n, dimensions,
-                        centroids, labels, max_iterations
-                    );
-                };
-
-                soa_dynamic_runs = benchmark("OpenMP SoA dynamic", run_soa_dynamic, points);
-            }
-
-            // Use one reference for every measured run of this dataset.
-            const auto& reference = RUN_SEQUENTIAL
-                ? sequential_runs.front()
-                : (RUN_OPENMP ? openmp_runs.front()
-                              : (RUN_OPENMP_SOA ? soa_runs.front() : soa_dynamic_runs.front()));
-            cout << "\nCentroid comparison (reference: first "
-                 << (RUN_SEQUENTIAL ? "sequential"
-                                     : (RUN_OPENMP ? "OpenMP AoS"
-                                                   : (RUN_OPENMP_SOA ? "OpenMP SoA static" : "OpenMP SoA dynamic")))
-                 << " measured run)\n";
-
-            if (RUN_SEQUENTIAL) {
-                print_centroid_differences("Sequential", sequential_runs, reference);
-            }
-            if (RUN_OPENMP) {
-                print_centroid_differences("OpenMP AoS", openmp_runs, reference);
-            }
-            if (RUN_OPENMP_SOA) {
-                print_centroid_differences("OpenMP SoA static", soa_runs, reference);
-            }
-            if (RUN_OPENMP_SOA_DYNAMIC) {
-                print_centroid_differences("OpenMP SoA dynamic", soa_dynamic_runs, reference);
+                if (RUN_OPENMP_SOA_DYNAMIC) {
+                    auto run_soa_dynamic = [&soa_points, n, dimensions](
+                        Centroids& centroids, vector<int>& labels, int max_iterations
+                    ) {
+                        return kmeans_openmp_soa_dynamic(soa_points, n, dimensions, centroids, labels, max_iterations);
+                    };
+                    run_parallel_cases("OpenMP SoA dynamic", run_soa_dynamic);
+                }
             }
         }
 
+        cout << "\nCompleted. CSV files: " << filesystem::absolute(result_directory).string() << "\n";
         return 0;
     } catch (const exception& error) {
         cerr << error.what() << "\n";
